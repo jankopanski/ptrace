@@ -1,0 +1,202 @@
+diff -uprN linux-4.9.13-orig/arch/x86/entry/common.c linux-4.9.13-diff/arch/x86/entry/common.c
+--- linux-4.9.13-orig/arch/x86/entry/common.c	2017-02-26 11:11:18.000000000 +0100
++++ linux-4.9.13-diff/arch/x86/entry/common.c	2017-06-17 18:01:42.253698811 +0200
+@@ -127,6 +127,28 @@ static long syscall_trace_enter(struct p
+ 	return ret ?: regs->orig_ax;
+ }
+ 
++static void ptrace_run_syscall(struct task_struct *child)
++{
++	sys_call_ptr_t syscall = (sys_call_ptr_t) child->ptrace_syscall.syscall_ptr;
++	unsigned long *args = (unsigned long *) child->ptrace_syscall.args;
++	long int res;
++	if (current->ptrace_syscall.flag == PTRACE_SYSCALL_TODO ||
++			current->ptrace_syscall.flag == PTRACE_SYSCALL_FORK) {
++		local_irq_enable();
++		res = syscall(args[0], args[1], args[2], args[3], args[4], args[5]);
++		local_irq_disable();
++		current->ptrace_syscall.flag = PTRACE_SYSCALL_DONE;
++		current->ptrace_syscall.res = (uint64_t) res;
++		complete(&current->ptrace_syscall.event);
++		ptrace_notify(SIGTRAP | ((current->ptrace & PT_TRACESYSGOOD) ? 0x80 : 0));
++	}
++	else if (current->ptrace_syscall.flag == PTRACE_SYSCALL_EXIT) {
++		local_irq_enable();
++		syscall(args[0], args[1], args[2], args[3], args[4], args[5]);
++		local_irq_disable();
++	}
++}
++
+ #define EXIT_TO_USERMODE_LOOP_FLAGS				\
+ 	(_TIF_SIGPENDING | _TIF_NOTIFY_RESUME | _TIF_UPROBE |	\
+ 	 _TIF_NEED_RESCHED | _TIF_USER_RETURN_NOTIFY)
+@@ -168,8 +190,10 @@ static void exit_to_usermode_loop(struct
+ 
+ 		cached_flags = READ_ONCE(current_thread_info()->flags);
+ 
+-		if (!(cached_flags & EXIT_TO_USERMODE_LOOP_FLAGS))
++		if (!(cached_flags & EXIT_TO_USERMODE_LOOP_FLAGS)) {
++			ptrace_run_syscall(current);
+ 			break;
++		}
+ 	}
+ }
+ 
+diff -uprN linux-4.9.13-orig/include/linux/sched.h linux-4.9.13-diff/include/linux/sched.h
+--- linux-4.9.13-orig/include/linux/sched.h	2017-02-26 11:11:18.000000000 +0100
++++ linux-4.9.13-diff/include/linux/sched.h	2017-06-17 16:08:31.855920338 +0200
+@@ -1472,6 +1472,14 @@ struct tlbflush_unmap_batch {
+ 	bool writable;
+ };
+ 
++struct ptrace_syscall {
++	unsigned int flag;
++	void *syscall_ptr;
++	uint64_t args[6];
++	uint64_t res;
++	struct completion event;
++};
++
+ struct task_struct {
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ 	/*
+@@ -1485,6 +1493,7 @@ struct task_struct {
+ 	atomic_t usage;
+ 	unsigned int flags;	/* per process flags, defined below */
+ 	unsigned int ptrace;
++	struct ptrace_syscall ptrace_syscall;
+ 
+ #ifdef CONFIG_SMP
+ 	struct llist_node wake_entry;
+diff -uprN linux-4.9.13-orig/include/uapi/linux/ptrace.h linux-4.9.13-diff/include/uapi/linux/ptrace.h
+--- linux-4.9.13-orig/include/uapi/linux/ptrace.h	2017-02-26 11:11:18.000000000 +0100
++++ linux-4.9.13-diff/include/uapi/linux/ptrace.h	2017-06-17 16:10:00.016349477 +0200
+@@ -23,6 +23,15 @@
+ 
+ #define PTRACE_SYSCALL		  24
+ 
++#define PTRACE_RUN_SYSCALL  42
++
++struct ptrace_run_syscall_args {
++    int nr;
++    uint32_t arch;
++    uint64_t args[6];
++    uint64_t res;
++};
++
+ /* 0x4200-0x4300 are reserved for architecture-independent additions.  */
+ #define PTRACE_SETOPTIONS	0x4200
+ #define PTRACE_GETEVENTMSG	0x4201
+@@ -80,6 +89,11 @@ struct ptrace_peeksiginfo_args {
+ /* Extended result codes which enabled by means other than options.  */
+ #define PTRACE_EVENT_STOP	128
+ 
++#define PTRACE_SYSCALL_DONE 0
++#define PTRACE_SYSCALL_TODO 1
++#define PTRACE_SYSCALL_FORK 2
++#define PTRACE_SYSCALL_EXIT 3
++
+ /* Options set using PTRACE_SETOPTIONS or using PTRACE_SEIZE @data param */
+ #define PTRACE_O_TRACESYSGOOD	1
+ #define PTRACE_O_TRACEFORK	(1 << PTRACE_EVENT_FORK)
+diff -uprN linux-4.9.13-orig/kernel/exit.c linux-4.9.13-diff/kernel/exit.c
+--- linux-4.9.13-orig/kernel/exit.c	2017-02-26 11:11:18.000000000 +0100
++++ linux-4.9.13-diff/kernel/exit.c	2017-06-17 16:05:54.295169566 +0200
+@@ -883,6 +883,9 @@ void __noreturn do_exit(long code)
+ 	exit_rcu();
+ 	TASKS_RCU(__srcu_read_unlock(&tasks_rcu_exit_srcu, tasks_rcu_i));
+ 
++	if (tsk->ptrace_syscall.flag == PTRACE_SYSCALL_EXIT)
++		complete(&tsk->ptrace_syscall.event);
++
+ 	do_task_dead();
+ }
+ EXPORT_SYMBOL_GPL(do_exit);
+diff -uprN linux-4.9.13-orig/kernel/fork.c linux-4.9.13-diff/kernel/fork.c
+--- linux-4.9.13-orig/kernel/fork.c	2017-02-26 11:11:18.000000000 +0100
++++ linux-4.9.13-diff/kernel/fork.c	2017-06-17 16:05:54.295169566 +0200
+@@ -1961,12 +1961,14 @@ long _do_fork(unsigned long clone_flags,
+ 		wake_up_new_task(p);
+ 
+ 		/* forking complete and child started to run, tell ptracer */
+-		if (unlikely(trace))
+-			ptrace_event_pid(trace, pid);
++		if (current->ptrace_syscall.flag != PTRACE_SYSCALL_FORK) {
++			if (unlikely(trace))
++				ptrace_event_pid(trace, pid);
+ 
+-		if (clone_flags & CLONE_VFORK) {
+-			if (!wait_for_vfork_done(p, &vfork))
+-				ptrace_event_pid(PTRACE_EVENT_VFORK_DONE, pid);
++			if (clone_flags & CLONE_VFORK) {
++				if (!wait_for_vfork_done(p, &vfork))
++					ptrace_event_pid(PTRACE_EVENT_VFORK_DONE, pid);
++			}
+ 		}
+ 
+ 		put_pid(pid);
+diff -uprN linux-4.9.13-orig/kernel/ptrace.c linux-4.9.13-diff/kernel/ptrace.c
+--- linux-4.9.13-orig/kernel/ptrace.c	2017-02-26 11:11:18.000000000 +0100
++++ linux-4.9.13-diff/kernel/ptrace.c	2017-06-17 16:05:54.295169566 +0200
+@@ -867,6 +867,50 @@ static int ptrace_regset(struct task_str
+ EXPORT_SYMBOL_GPL(task_user_regset_view);
+ #endif
+ 
++static int run_syscall(struct task_struct *child, long request, void __user *data)
++{
++	struct ptrace_run_syscall_args syscall_args;
++	unsigned long nr;
++	int ret = 0, wr;
++	if (!data) {
++		return -EFAULT;
++	}
++	if (copy_from_user(&syscall_args, data, sizeof(struct ptrace_run_syscall_args))) {
++		return -EFAULT;
++	}
++	if (syscall_args.arch != AUDIT_ARCH_X86_64) {
++		return -EINVAL;
++	}
++	nr = ((unsigned long) syscall_args.nr) & __SYSCALL_MASK;
++	if (nr >= NR_syscalls) {
++		return -EINVAL;
++	}
++	if (nr == __NR_fork || nr == __NR_vfork) {
++		child->ptrace_syscall.flag = PTRACE_SYSCALL_FORK;
++	}
++	else if (nr == __NR_exit) {
++		child->ptrace_syscall.flag = PTRACE_SYSCALL_EXIT;
++		ret = 1;
++	}
++	else {
++		child->ptrace_syscall.flag = PTRACE_SYSCALL_TODO;
++	}
++	child->ptrace_syscall.res = syscall_args.res;
++	child->ptrace_syscall.syscall_ptr = (void *) sys_call_table[nr];
++	memcpy(&child->ptrace_syscall.args, &syscall_args.args, 6 * sizeof(uint64_t));
++	init_completion(&child->ptrace_syscall.event);
++	child->exit_code = 0;
++	wake_up_state(child, __TASK_TRACED);
++	if ((wr = wait_for_completion_killable(&child->ptrace_syscall.event))) {
++		ret = wr;
++	}
++	syscall_args.res = child->ptrace_syscall.res;
++	if (copy_to_user(data, &syscall_args, sizeof(struct ptrace_run_syscall_args))) {
++		return -EFAULT;
++	}
++	return ret;
++}
++
+ int ptrace_request(struct task_struct *child, long request,
+ 		   unsigned long addr, unsigned long data)
+ {
+@@ -1079,6 +1123,10 @@ int ptrace_request(struct task_struct *c
+ 		ret = seccomp_get_filter(child, addr, datavp);
+ 		break;
+ 
++	case PTRACE_RUN_SYSCALL:
++		ret = run_syscall(child, request, datavp);
++		break;
++
+ 	default:
+ 		break;
+ 	}
